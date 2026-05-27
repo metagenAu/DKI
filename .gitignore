@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+results/dki_smoke/
+results/legacy_smoke/
+results/dki_phase1/
+results/legacy_run/
