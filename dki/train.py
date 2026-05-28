@@ -68,6 +68,7 @@ class TrainResult:
     epoch_seconds: List[float] = field(default_factory=list)
     final_train_loss: float = math.nan
     final_val_loss: float = math.nan
+    skipped_steps: int = 0
 
 
 def _sample_batch(z: torch.Tensor, p: torch.Tensor, batch_size: int, generator: torch.Generator):
@@ -124,8 +125,16 @@ def train(cfg: TrainConfig, data: Optional[DKIData] = None) -> tuple[nn.Module, 
 
         optim_.zero_grad(set_to_none=True)
         train_loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optim_.step()
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        # A stiff replicator field (common with the nonlinear SiLU fitness) can
+        # make a single batch's ODE solve return a non-finite state, hence a
+        # non-finite loss/gradient. Stepping on that poisons every weight with
+        # NaN via Adam and the whole run reads NaN forever. Skip the update so
+        # the optimiser stays on the last good state and the next batch resumes.
+        if torch.isfinite(train_loss) and torch.isfinite(grad_norm):
+            optim_.step()
+        else:
+            result.skipped_steps += 1
         scheduler.step()
 
         # Validation: one batched solve over the whole val set, scored on BC
@@ -157,6 +166,13 @@ def train(cfg: TrainConfig, data: Optional[DKIData] = None) -> tuple[nn.Module, 
         if epochs_since_improvement >= cfg.early_stop_patience:
             print(f"Early stopping at epoch {epoch} (no improvement for {cfg.early_stop_patience}).")
             break
+
+    if result.skipped_steps:
+        print(
+            f"Skipped {result.skipped_steps} optimiser step(s) on non-finite "
+            "loss/gradient (kept the last good weights). Consider a smaller lr, "
+            "lower t_final, or mode='deq' if this happens often."
+        )
 
     model.load_state_dict(best_state)
     result.final_train_loss = result.train_loss[-1]
