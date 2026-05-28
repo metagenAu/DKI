@@ -26,8 +26,11 @@ distinct synergy-aware (Shapley) extension. Both will live alongside
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 import pandas as pd
+import torch
 
 
 def _bc(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
@@ -108,3 +111,144 @@ def classical_structural_keystoneness(
             "k_true": bc_true * (1.0 - p_s),
         })
     return pd.DataFrame(rows)
+
+
+def null_model_keystoneness(
+    predict_fn: Callable[[torch.Tensor], torch.Tensor],
+    z_all: torch.Tensor,
+    ptrn: np.ndarray,
+    sample_id: np.ndarray,
+    species_id: np.ndarray,
+    n_null: int = 50,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Phase-4 null-model z-score calibration of structural keystoneness.
+
+    For each (sample, focal species) pair we draw up to ``n_null`` *abundance-
+    matched* null species — present species in the same sample whose relative
+    abundance is closest to the focal species — and compute the classical
+    structural keystoneness for each. The focal score is then reported as a
+    z-score against this per-sample null distribution::
+
+        k_zscore = (k_classical - mean_null) / std_null
+
+    This is an **alternative** calibration that answers "is this species more
+    impactful than equally-abundant species in the same community?", reported
+    alongside (never replacing) ``k_classical``.
+
+    Parameters
+    ----------
+    predict_fn
+        ``predict_fn(z) -> q`` mapping a batch of presence-normalised
+        assemblages (shape ``(B, N)``) to predicted equilibria. Typically an
+        ensemble mean (see :class:`dki.ensemble.EnsemblePredictor`).
+    z_all
+        Presence-normalised assemblages (uniform over the present support),
+        shape ``(n_samples, N)``. The leave-one-out assemblages are derived
+        from these.
+    ptrn
+        Observed abundances, shape ``(n_species, n_samples)`` (legacy
+        orientation). Columns are renormalised internally to the simplex.
+    sample_id, species_id
+        1-indexed (sample, species) pairs, as in the classical port.
+    n_null
+        Maximum number of abundance-matched null species per pair.
+    seed
+        Seeds tie-breaking when more candidates than ``n_null`` share the same
+        abundance distance.
+
+    Returns
+    -------
+    DataFrame with ``sample``, ``species``, ``p_species``, ``k_classical``,
+    ``k_null_mean``, ``k_null_std``, ``k_zscore`` and ``n_null_used``.
+    """
+    if len(sample_id) != len(species_id):
+        raise ValueError("sample_id and species_id must be the same length")
+
+    rng = np.random.default_rng(seed)
+    device = z_all.device
+    P = ptrn / ptrn.sum(axis=0, keepdims=True).clip(min=1e-12)
+
+    n_pairs = len(sample_id)
+    samples0 = np.asarray(sample_id, dtype=int) - 1
+    species0 = np.asarray(species_id, dtype=int) - 1
+
+    # Predicted full-community composition for each sample that appears.
+    unique_samples = np.unique(samples0)
+    q_with_all = predict_fn(z_all[torch.as_tensor(unique_samples, device=device)])
+    q_with_map = {
+        int(s): q_with_all[i].detach().cpu().numpy()
+        for i, s in enumerate(unique_samples)
+    }
+
+    # Build every leave-one-out assemblage (focal + nulls) up front, then run
+    # a single batched prediction.
+    loo_rows = []                 # tensors (N,)
+    pair_meta = []                # per-pair: (focal_offset, null_offsets, null_species)
+    for i in range(n_pairs):
+        s, sp = int(samples0[i]), int(species0[i])
+        z_s = z_all[s]
+        present = torch.nonzero(z_s > 0, as_tuple=False).flatten().cpu().numpy()
+        candidates = present[present != sp]
+        if candidates.size > n_null:
+            a_focal = P[sp, s]
+            dist = np.abs(P[candidates, s] - a_focal)
+            jitter = rng.random(candidates.size) * 1e-12
+            order = np.argsort(dist + jitter)
+            chosen = candidates[order[:n_null]]
+        else:
+            chosen = candidates
+
+        focal_offset = len(loo_rows)
+        loo_rows.append(_loo_assemblage(z_s, sp))
+        null_offsets = []
+        for c in chosen:
+            null_offsets.append(len(loo_rows))
+            loo_rows.append(_loo_assemblage(z_s, int(c)))
+        pair_meta.append((focal_offset, null_offsets, chosen))
+
+    q_loo = predict_fn(torch.stack(loo_rows, dim=0)).detach().cpu().numpy()
+
+    rows = []
+    for i in range(n_pairs):
+        s, sp = int(samples0[i]), int(species0[i])
+        focal_offset, null_offsets, chosen = pair_meta[i]
+        q_with = q_with_map[s]
+
+        k_focal = _structural_k(q_with, q_loo[focal_offset], sp, P[sp, s])
+        null_ks = np.array(
+            [_structural_k(q_with, q_loo[o], int(c), P[int(c), s])
+             for o, c in zip(null_offsets, chosen)]
+        )
+
+        if null_ks.size >= 2:
+            mean_null = float(null_ks.mean())
+            std_null = float(null_ks.std(ddof=1))
+            z = (k_focal - mean_null) / std_null if std_null > 0 else np.nan
+        else:
+            mean_null = float(null_ks.mean()) if null_ks.size else np.nan
+            std_null = np.nan
+            z = np.nan
+
+        rows.append({
+            "sample": s + 1,
+            "species": sp + 1,
+            "p_species": float(P[sp, s]),
+            "k_classical": k_focal,
+            "k_null_mean": mean_null,
+            "k_null_std": std_null,
+            "k_zscore": z,
+            "n_null_used": int(null_ks.size),
+        })
+    return pd.DataFrame(rows)
+
+
+def _loo_assemblage(z_s: torch.Tensor, drop: int) -> torch.Tensor:
+    """Uniform assemblage over ``z_s``'s support with species ``drop`` removed."""
+    v = z_s.clone()
+    v[drop] = 0.0
+    return v / v.sum().clamp_min(1e-12)
+
+
+def _structural_k(q_with: np.ndarray, q_without: np.ndarray, sp: int, p_s: float) -> float:
+    return _bc(_renormalise_without(q_with, sp), q_without) * (1.0 - float(p_s))
