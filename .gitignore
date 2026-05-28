@@ -4,4 +4,7 @@ __pycache__/
 results/dki_smoke/
 results/legacy_smoke/
 results/dki_phase1/
+results/dki_phase1_clean/
+results/dki_clean5/
 results/legacy_run/
+results/legacy_clean/
