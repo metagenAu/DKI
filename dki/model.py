@@ -64,11 +64,39 @@ def integrate(
     rtol: float = 1e-5,
     atol: float = 1e-7,
     options: Optional[dict] = None,
+    fallback_method: str = "rk4",
+    fallback_steps: int = 200,
 ) -> torch.Tensor:
-    """Batched ODE integration. ``z0`` shape ``(B, N)`` → returns ``(B, N)``."""
+    """Batched ODE integration. ``z0`` shape ``(B, N)`` → returns ``(B, N)``.
+
+    Robustness: a nonlinear fitness can make the learned vector field stiff mid
+    training, at which point the adaptive solver (``dopri5``) shrinks its step
+    until it underflows machine precision and torchdiffeq raises
+    ``AssertionError: underflow in dt ...`` (or asserts on a non-finite state),
+    killing the whole run over a single bad batch. When that happens — or when
+    the adaptive solve returns a non-finite result — we fall back to a
+    fixed-step solver (``fallback_method`` over ``fallback_steps`` uniform
+    steps), which has no adaptive step to underflow and so always returns. The
+    common case (adaptive solve succeeds) is unchanged. ``fallback_steps <= 0``
+    disables the fallback and re-raises the original error.
+    """
     if z0.dim() == 1:
         z0 = z0.unsqueeze(0)
     t = torch.tensor([0.0, float(t_final)], dtype=z0.dtype, device=z0.device)
-    traj = odeint(func, z0, t, method=method, rtol=rtol, atol=atol, options=options)
+    try:
+        traj = odeint(func, z0, t, method=method, rtol=rtol, atol=atol, options=options)
+        out = traj[-1]
+        if torch.isfinite(out).all():
+            return out
+    except AssertionError:
+        if fallback_steps <= 0:
+            raise
+    if fallback_steps <= 0:
+        raise RuntimeError(
+            f"Adaptive solver '{method}' returned non-finite values and the "
+            "fixed-step fallback is disabled (fallback_steps <= 0)."
+        )
+    step = float(t_final) / fallback_steps
+    traj = odeint(func, z0, t, method=fallback_method, options={"step_size": step})
     # traj shape: (len(t), B, N)
     return traj[-1]
