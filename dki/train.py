@@ -25,14 +25,19 @@ from .model import ReplicatorODEFunc
 class TrainConfig:
     data_dir: str = "data"
     out_dir: str = "results"
-    epochs: int = 200
+    epochs: int = 1000           # one minibatch step per epoch; matches
+                                 # the original DKI.py max_epochs and gives
+                                 # ~50 passes over a 400-sample train set
+                                 # at batch_size=20.
     batch_size: int = 20
     lr: float = 1e-2
     min_lr: float = 1e-4
     weight_decay: float = 0.0
     t_final: float = 100.0
     grad_clip: float = 1.0
-    early_stop_patience: int = 50
+    early_stop_patience: int = 200   # val BC is noisy; need a long plateau
+                                     # before stopping. Set to a large
+                                     # number (or > epochs) to disable.
     val_fraction: float = 0.2
     seed: int = 0
     method: str = "dopri5"
@@ -160,13 +165,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train a DKI model.")
     p.add_argument("--data", default="data", help="Directory holding Ptrain.csv etc.")
     p.add_argument("--out", default="results", help="Where to write predictions/checkpoints.")
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--min-lr", type=float, default=1e-4)
     p.add_argument("--t-final", type=float, default=100.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--early-stop-patience", type=int, default=50)
+    p.add_argument("--early-stop-patience", type=int, default=200)
     p.add_argument("--val-fraction", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--method", default="dopri5")
