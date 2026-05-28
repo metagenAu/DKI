@@ -19,19 +19,26 @@ def bray_curtis(p_pred: torch.Tensor, p_true: torch.Tensor, eps: float = 1e-12) 
     return (num / den).mean()
 
 
-def clr(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def clr(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """Centered-log-ratio transform along the last axis.
 
     ``clr(x)_i = log(x_i) - mean_j log(x_j)`` after flooring at ``eps`` to keep
     structural zeros finite. CLR works in ratio space, so it weights rare
     species far more heavily than Bray-Curtis (which is dominated by the
     abundant species). That is the point of Phase 2's composite loss.
+
+    The floor doubles as gradient regularisation: ``d log(x)/dx = 1/x`` so a
+    too-small ``eps`` lets a single near-zero prediction inject a ~1/eps spike
+    into the backward pass, which then destabilises the SiLU fitness and the
+    downstream ODE solve (``dopri5`` shrinks dt until it underflows). ``1e-4``
+    caps the per-element gradient at ~10^4 while leaving abundant-species
+    behaviour intact.
     """
     log_x = x.clamp_min(eps).log()
     return log_x - log_x.mean(dim=-1, keepdim=True)
 
 
-def clr_mse(p_pred: torch.Tensor, p_true: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def clr_mse(p_pred: torch.Tensor, p_true: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """Mean-squared error between CLR-transformed predictions and targets."""
     return ((clr(p_pred, eps) - clr(p_true, eps)) ** 2).mean()
 
@@ -40,7 +47,7 @@ def composite_loss(
     p_pred: torch.Tensor,
     p_true: torch.Tensor,
     alpha: float = 0.3,
-    eps: float = 1e-6,
+    eps: float = 1e-4,
 ) -> torch.Tensor:
     """Phase-2 composite loss ``α·BC + (1−α)·CLR-MSE``.
 
