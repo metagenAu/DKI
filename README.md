@@ -22,6 +22,48 @@ We have tested this code for Python 3.8.13 and R 4.1.2.
 Previous studies suggested that microbial communities harbor keystone species whose removal can cause a dramatic shift in microbiome structure and functioning. Yet, an efficient method to systematically identify keystone species in microbial communities is still lacking. This is mainly due to our limited knowledge of microbial dynamics and the experimental and ethical difficulties of manipulating microbial communities. Here, we propose a Data-driven Keystone species Identification (DKI) framework based on deep learning to resolve this challenge. Our key idea is to implicitly learn the assembly rules of microbial communities from a particular habitat by training a deep learning model using microbiome samples collected from this habitat. The well-trained deep learning model enables us to quantify the community-specific keystoneness of each species in any microbiome sample from this habitat by conducting a thought experiment on species removal. We systematically validated this DKI framework using synthetic data generated from a classical population dynamics model in community ecology. We then applied DKI to analyze human gut, oral microbiome, soil, and coral microbiome data. We found that those taxa with high median keystoneness across different communities display strong community specificity, and many of them have been reported as keystone taxa in literature. The presented DKI framework demonstrates the power of machine learning in tackling a fundamental problem in community ecology, paving the way for the data-driven management of complex microbial communities.
 
 
+# Refactor in progress
+
+The original code is preserved at `legacy/DKI_original.py` and
+`Keystoneness_computing.R`. A staged refactor is underway in the
+`dki/` Python package — each phase ships behind its own sanity check
+before the next is started.
+
+| Phase | Status | What it adds |
+|---|---|---|
+| **1. Faithful refactor + batched integration** | ✅ landed | `dki/` package (`data`, `model`, `losses`, `infer`, `train`, `keystoneness`), batched `dopri5` replicator ODE (`rtol=1e-5`, `atol=1e-7`, `t=[0,100]`), cosine LR, gradient clipping at 1.0, early stop on val BC, best-val checkpoint, auto CUDA/MPS/CPU. CLI: `python -m dki.train --data data`. ~600× per-epoch speedup over the original. |
+| **2. Nonlinear ODEFunc + composite loss** | planned | Per-capita fitness becomes `fc2(SiLU(fc1(y)))` with hidden dim `2N`. The original cNODE2's two stacked `Linear` layers without activation are provably equivalent to a single `Linear` (W2·W1 = W) — the test suite includes a regression covering this. Composite loss `α·BC + (1−α)·CLR-MSE` (default α=0.3) to repair rare-species accuracy. |
+| **3. Deep-equilibrium reformulation** | planned | `--mode deq`: solve the replicator fixed point directly with Anderson acceleration (50 iterations, tol 1e-6), backprop via the implicit function theorem. Falls back to the ODE solver on non-convergence. Target ≥3× faster training while matching ODE predictions within mean BC < 0.01. |
+| **4. Ensembles + uncertainty + null-model normalisation** | planned | K=5 bootstrap-resampled models → predictions become `(mean, std)`. Keystoneness module gains an **alternative** z-score calibration (50 abundance-matched null species per (sample, species)) alongside — not replacing — the classical `(1−p)` formula. |
+| **5. Shapley keystoneness** *(extension)* | planned | Monte-Carlo Shapley (N_perm=200) for a **different question** — synergy/redundancy-aware contribution — not a fix to the classical definition. Reported as `k_shapley_synergistic`; never replaces `k_classical` or `k_zscore`. Lives under `dki/extensions/`. |
+| **6. Self-consistency regulariser** | planned | Training-time auxiliary loss: mask one present species, predict q', re-feed q'>0 through the model, require the second prediction matches q' under BC. Weighted by `λ_consistency=0.1`. Goal: tighter ensemble std for keystoneness. |
+
+Design notes pinned by the project:
+
+* The metacommunity assumption (same `f` across all samples; only `z`
+  varies) is preserved — the ODEFunc takes **only `y`**. No covariate
+  conditioning, no hypernetworks, no context-dependent interactions.
+* Classical Paine-style keystoneness stays in the default output; the
+  null z-score and Shapley results land as alternatives, not
+  replacements.
+
+A Colab notebook that runs the whole pipeline end-to-end lives at
+[`notebooks/dki_colab.ipynb`](notebooks/dki_colab.ipynb)
+([open in Colab](https://colab.research.google.com/github/metagenAu/DKI/blob/claude/peaceful-goodall-4AC8l/notebooks/dki_colab.ipynb)).
+
+## Why the nonlinearity matters (Phase 2 — preview)
+
+SI §2 of the paper claims that going from cNODE (one `Linear`) to cNODE2
+(two stacked `Linear` layers) captures "non-linear interactions between
+species." Mathematically, `W₂(W₁ y) = (W₂ W₁) y` is still a single
+linear map — the two-Linear-without-activation construction is
+equivalent in expressivity to a single `Linear` layer with `W = W₂ W₁`.
+The overall dynamics are nonlinear only because of the replicator
+wrapping, and that was already true in cNODE. Phase 2 inserts a SiLU
+between the layers so the *fitness* function itself becomes nonlinear,
+and ships a regression test that exhibits a 1000-input residual ≈ 0
+for the legacy product collapse and ≫ 0 for the SiLU version.
+
 # Repo Contents
 (1) A synthetic dataset to test the Data-driven Keystone species Identification (DKI) framework.
 
