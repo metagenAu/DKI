@@ -32,11 +32,11 @@ before the next is started.
 | Phase | Status | What it adds |
 |---|---|---|
 | **1. Faithful refactor + batched integration** | ✅ landed | `dki/` package (`data`, `model`, `losses`, `infer`, `train`, `keystoneness`), batched `dopri5` replicator ODE (`rtol=1e-5`, `atol=1e-7`, `t=[0,100]`), cosine LR, gradient clipping at 1.0, early stop on val BC, best-val checkpoint, auto CUDA/MPS/CPU. CLI: `python -m dki.train --data data`. ~600× per-epoch speedup over the original. |
-| **2. Nonlinear ODEFunc + composite loss** | planned | Per-capita fitness becomes `fc2(SiLU(fc1(y)))` with hidden dim `2N`. The original cNODE2's two stacked `Linear` layers without activation are provably equivalent to a single `Linear` (W2·W1 = W) — the test suite includes a regression covering this. Composite loss `α·BC + (1−α)·CLR-MSE` (default α=0.3) to repair rare-species accuracy. |
-| **3. Deep-equilibrium reformulation** | planned | `--mode deq`: solve the replicator fixed point directly with Anderson acceleration (50 iterations, tol 1e-6), backprop via the implicit function theorem. Falls back to the ODE solver on non-convergence. Target ≥3× faster training while matching ODE predictions within mean BC < 0.01. |
-| **4. Ensembles + uncertainty + null-model normalisation** | planned | K=5 bootstrap-resampled models → predictions become `(mean, std)`. Keystoneness module gains an **alternative** z-score calibration (50 abundance-matched null species per (sample, species)) alongside — not replacing — the classical `(1−p)` formula. |
-| **5. Shapley keystoneness** *(extension)* | planned | Monte-Carlo Shapley (N_perm=200) for a **different question** — synergy/redundancy-aware contribution — not a fix to the classical definition. Reported as `k_shapley_synergistic`; never replaces `k_classical` or `k_zscore`. Lives under `dki/extensions/`. |
-| **6. Self-consistency regulariser** | planned | Training-time auxiliary loss: mask one present species, predict q', re-feed q'>0 through the model, require the second prediction matches q' under BC. Weighted by `λ_consistency=0.1`. Goal: tighter ensemble std for keystoneness. |
+| **2. Nonlinear ODEFunc + composite loss** | ✅ landed | `--nonlinear` makes per-capita fitness `fc2(SiLU(fc1(y)))` with hidden dim `hidden_mult·N` (default `2N`). The original cNODE2's two stacked `Linear` layers without activation are provably equivalent to a single `Linear` (W2·W1 = W); `tests/test_phase2.py` exhibits a near-zero best-affine-fit residual for the legacy collapse and a large one for the SiLU version. `--loss composite --alpha 0.3` adds `α·BC + (1−α)·CLR-MSE` to repair rare-species accuracy. |
+| **3. Deep-equilibrium reformulation** | ✅ landed | `--mode deq` (`dki/deq.py`): solves the replicator fixed point with **safeguarded** Anderson acceleration (50 iters, tol 1e-6) on a simplex-preserving mirror-descent map, backprop via the implicit function theorem (adjoint linear solve in a backward hook). Per-row safeguarding rejects any extrapolation that raises the residual, so it lands on the *stable* equilibrium the ODE flow reaches; falls back to the ODE solver on non-convergence. Matches the ODE within BC < 0.02 on the potential-game regression test. |
+| **4. Ensembles + uncertainty + null-model normalisation** | ✅ landed | `dki/ensemble.py`: `train_ensemble` fits K bootstrap-resampled models (default K=5, distinct seeds), `EnsemblePredictor.predict` returns `(mean, std)`. Keystoneness module gains an **alternative** z-score calibration (`null_model_keystoneness`, up to 50 abundance-matched null species per (sample, species)) alongside — not replacing — the classical `(1−p)` formula. |
+| **5. Shapley keystoneness** *(extension)* | ✅ landed | `dki/extensions/shapley.py`: Monte-Carlo Shapley (default `n_perm=200`) for a **different question** — synergy/redundancy-aware contribution — not a fix to the classical definition. Value function `v(S)=1−BC(q_Ω, q_S)`; reported as `k_shapley_synergistic`, never replacing `k_classical` or `k_zscore`. |
+| **6. Self-consistency regulariser** | ✅ landed | `--consistency-weight 0.1` adds a training-time auxiliary loss (`self_consistency_loss`): mask one present species, predict `q'`, re-feed `q'` as an initial condition, require the re-integrated prediction matches `q'` under BC. Pushes predictions to be genuine fixed points (tighter ensemble std for keystoneness). |
 
 Design notes pinned by the project:
 
@@ -51,7 +51,7 @@ A Colab notebook that runs the whole pipeline end-to-end lives at
 [`notebooks/dki_colab.ipynb`](notebooks/dki_colab.ipynb)
 ([open in Colab](https://colab.research.google.com/github/metagenAu/DKI/blob/claude/peaceful-goodall-4AC8l/notebooks/dki_colab.ipynb)).
 
-## Why the nonlinearity matters (Phase 2 — preview)
+## Why the nonlinearity matters (Phase 2)
 
 SI §2 of the paper claims that going from cNODE (one `Linear`) to cNODE2
 (two stacked `Linear` layers) captures "non-linear interactions between

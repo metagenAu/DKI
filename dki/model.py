@@ -12,23 +12,43 @@ from torchdiffeq import odeint
 class ReplicatorODEFunc(nn.Module):
     """Per-capita-fitness network wrapped in replicator dynamics.
 
-    Phase-1 architecture matches the legacy DKI model: two stacked linear
-    layers with no activation (i.e. an affine map ``A y + b``). The replicator
-    wrapper ``y * (out - <out, y>)`` keeps the trajectory on the simplex.
+    Two regimes, selected by ``nonlinear``:
 
-    The forward pass accepts state of shape ``(B, N)`` where B is the batch
-    dimension. The legacy code integrated each sample in a Python loop with
-    shape ``(1, N)``; this class handles both transparently.
+    * ``nonlinear=False`` (Phase-1, default) — fitness is two stacked linear
+      layers with no activation, ``fcc2(fcc1(y))``. This is the legacy DKI
+      ``cNODE2`` model. Note ``W₂(W₁ y) = (W₂ W₁) y`` is a single linear map,
+      so the *fitness* function is linear; the dynamics are nonlinear only
+      through the replicator wrapping.
+    * ``nonlinear=True`` (Phase-2) — fitness is ``fcc2(SiLU(fcc1(y)))`` with a
+      hidden dimension of ``hidden_mult * n_species``. The SiLU makes the
+      per-capita fitness itself nonlinear, which two stacked ``Linear`` layers
+      alone cannot achieve.
+
+    The replicator wrapper ``y * (out - <out, y>)`` keeps the trajectory on the
+    simplex. The forward pass accepts state of shape ``(B, N)``; the legacy
+    code used ``(1, N)`` and this class handles both transparently.
     """
 
-    def __init__(self, n_species: int):
+    def __init__(self, n_species: int, nonlinear: bool = False, hidden_mult: int = 2):
         super().__init__()
         self.n_species = n_species
-        self.fcc1 = nn.Linear(n_species, n_species)
-        self.fcc2 = nn.Linear(n_species, n_species)
+        self.nonlinear = nonlinear
+        self.hidden_mult = hidden_mult
+        if nonlinear:
+            hidden = hidden_mult * n_species
+            self.fcc1 = nn.Linear(n_species, hidden)
+            self.fcc2 = nn.Linear(hidden, n_species)
+            self.activation: Optional[nn.Module] = nn.SiLU()
+        else:
+            self.fcc1 = nn.Linear(n_species, n_species)
+            self.fcc2 = nn.Linear(n_species, n_species)
+            self.activation = None
 
     def fitness(self, y: torch.Tensor) -> torch.Tensor:
-        return self.fcc2(self.fcc1(y))
+        h = self.fcc1(y)
+        if self.activation is not None:
+            h = self.activation(h)
+        return self.fcc2(h)
 
     def forward(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # noqa: ARG002
         out = self.fitness(y)
