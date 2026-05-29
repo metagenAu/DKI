@@ -96,6 +96,49 @@ def test_integrate_falls_back_on_nonfinite_result(monkeypatch):
     assert torch.isfinite(out).all()
 
 
+def test_integrate_recovers_when_fixed_step_fallback_also_diverges(monkeypatch):
+    """Both dopri5 and the rk4 fixed-step fallback can overflow on an explosive
+    field. The projected last-resort integrator must still return finite,
+    on-simplex values for the bad rows — otherwise a whole-batch validation
+    solve reports val_bc=nan."""
+    N = 5
+    z = torch.rand(3, N)
+    z = z / z.sum(dim=-1, keepdim=True)
+    methods = []
+
+    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None):
+        methods.append(method)
+        # Row 0 stays finite; rows 1 and 2 blow up in *both* solvers.
+        bad = y0.clone()
+        bad[1:] = float("inf")
+        return torch.stack([y0, bad])
+
+    monkeypatch.setattr(model_mod, "odeint", fake_odeint)
+    out = integrate(ReplicatorODEFunc(N), z, t_final=100.0, fallback_steps=20)
+    assert methods == ["dopri5", "rk4"]
+    assert torch.isfinite(out).all()
+    sums = out.sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), sums
+    assert (out >= 0).all()
+
+
+def test_projected_integrate_is_finite_on_explosive_field():
+    """The projected integrator stays on the simplex even with huge weights that
+    make the raw field explode."""
+    torch.manual_seed(0)
+    N = 6
+    func = ReplicatorODEFunc(N, nonlinear=True)
+    with torch.no_grad():
+        for p in func.parameters():
+            p.mul_(50.0)  # blow up the field so plain explicit steps would diverge
+    z = torch.rand(4, N)
+    z = z / z.sum(dim=-1, keepdim=True)
+    out = model_mod._projected_integrate(func, z, t_final=100.0, steps=200)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out.sum(dim=-1), torch.ones(z.shape[0]), atol=1e-5)
+    assert (out >= 0).all()
+
+
 def test_integrate_reraises_when_fallback_disabled(monkeypatch):
     N = 5
     z = torch.rand(2, N)
