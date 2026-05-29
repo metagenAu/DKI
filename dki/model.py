@@ -56,6 +56,31 @@ class ReplicatorODEFunc(nn.Module):
         return y * (out - mean_fitness)
 
 
+def _projected_integrate(
+    func: nn.Module, z0: torch.Tensor, t_final: float, steps: int
+) -> torch.Tensor:
+    """Last-resort fixed-step integrator that can never return non-finite values.
+
+    Explicit Euler with a simplex projection (clamp to ``>= 0`` then renormalise
+    to sum 1) applied after every step. Replicator dynamics already preserve the
+    simplex, so the projection only corrects numerical drift — but crucially it
+    keeps the state a valid composition, where the fitness network is bounded.
+    A bounded field plus a finite state means ``y + dt·f(y)`` stays finite, so
+    unlike ``dopri5``/``rk4`` this integrator cannot overflow to ``inf``/``nan``.
+    Lower accuracy, but it always returns a finite estimate for rows the
+    adaptive and fixed-step solvers blow up on.
+    """
+    dt = float(t_final) / max(steps, 1)
+    t0 = torch.zeros((), dtype=z0.dtype, device=z0.device)
+    y = z0.clamp_min(0.0)
+    y = y / y.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    for _ in range(max(steps, 1)):
+        y = y + dt * func(t0, y)
+        y = y.clamp_min(0.0)
+        y = y / y.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return y
+
+
 def integrate(
     func: nn.Module,
     z0: torch.Tensor,
@@ -76,9 +101,17 @@ def integrate(
     killing the whole run over a single bad batch. When that happens — or when
     the adaptive solve returns a non-finite result — we fall back to a
     fixed-step solver (``fallback_method`` over ``fallback_steps`` uniform
-    steps), which has no adaptive step to underflow and so always returns. The
-    common case (adaptive solve succeeds) is unchanged. ``fallback_steps <= 0``
-    disables the fallback and re-raises the original error.
+    steps), which has no adaptive step to underflow.
+
+    The fixed-step solver still has no projection back onto the simplex, so on a
+    sufficiently stiff/explosive field it can *itself* overflow to a non-finite
+    state for some rows. Returning those rows unchecked is exactly what makes a
+    whole-batch validation solve report ``val_bc=nan`` (one ``nan`` row poisons
+    the batch mean), even though the weights stayed finite. So we detect any
+    remaining non-finite rows and re-solve just those with a simplex-projected
+    integrator that is guaranteed to return finite values. The common case
+    (adaptive solve succeeds) is unchanged. ``fallback_steps <= 0`` disables the
+    fallbacks and re-raises the original error.
     """
     if z0.dim() == 1:
         z0 = z0.unsqueeze(0)
@@ -98,5 +131,13 @@ def integrate(
         )
     step = float(t_final) / fallback_steps
     traj = odeint(func, z0, t, method=fallback_method, options={"step_size": step})
-    # traj shape: (len(t), B, N)
-    return traj[-1]
+    out = traj[-1]  # traj shape: (len(t), B, N)
+
+    # The fixed-step fallback has no simplex projection and can still overflow on
+    # an explosive field. Re-solve only the non-finite rows with the projected
+    # integrator so the result is always finite (no more val_bc=nan).
+    bad = ~torch.isfinite(out).all(dim=-1)
+    if bad.any():
+        out = out.clone()
+        out[bad] = _projected_integrate(func, z0[bad], t_final, fallback_steps)
+    return out
