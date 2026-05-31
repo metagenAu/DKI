@@ -39,6 +39,7 @@ class TrainConfig:
                                      # before stopping. Set to a large
                                      # number (or > epochs) to disable.
     val_fraction: float = 0.2
+    min_reads: float = 0.0       # read-depth QC filter on raw Ptrain (0 = off).
     seed: int = 0
     method: str = "dopri5"
     rtol: float = 1e-5
@@ -82,7 +83,10 @@ def train(cfg: TrainConfig, data: Optional[DKIData] = None) -> tuple[nn.Module, 
     np.random.seed(cfg.seed)
 
     if data is None:
-        data = load_dataset(cfg.data_dir, val_fraction=cfg.val_fraction, seed=cfg.seed)
+        data = load_dataset(
+            cfg.data_dir, val_fraction=cfg.val_fraction, seed=cfg.seed,
+            min_reads=cfg.min_reads,
+        )
     data = data.to(device)
     N = data.n_species
 
@@ -210,6 +214,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--early-stop-patience", type=int, default=200)
     p.add_argument("--val-fraction", type=float, default=0.2)
+    p.add_argument("--min-reads", type=float, default=0.0,
+                   help="Drop raw Ptrain samples with fewer total reads, then "
+                        "now-empty taxa, before the split (0 disables it).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--method", default="dopri5")
     p.add_argument("--rtol", type=float, default=1e-5)
@@ -246,6 +253,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         grad_clip=args.grad_clip,
         early_stop_patience=args.early_stop_patience,
         val_fraction=args.val_fraction,
+        min_reads=args.min_reads,
         seed=args.seed,
         method=args.method,
         rtol=args.rtol,

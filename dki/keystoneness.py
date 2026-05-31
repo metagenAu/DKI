@@ -26,11 +26,29 @@ distinct synergy-aware (Shapley) extension. Both will live alongside
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable
 
 import numpy as np
 import pandas as pd
 import torch
+
+
+def _warn_if_not_compositional(ptrn: np.ndarray) -> None:
+    """Keystoneness's ``(1 - p)`` factor needs ``p`` to be a relative abundance.
+
+    If any ``ptrn`` entry exceeds 1 the input is counts/percentages, not a
+    composition, and ``(1 - p)`` — hence keystoneness — goes negative. Warn
+    loudly rather than silently emit impossible negative scores.
+    """
+    if np.nanmax(np.abs(np.asarray(ptrn, dtype=float))) > 1.0 + 1e-6:
+        warnings.warn(
+            "ptrn has entries > 1, so it is not per-sample relative abundance "
+            "(columns should sum to 1). The (1 - p) factor will be negative and "
+            "keystoneness will come out negative. Normalise each Ptrain column "
+            "to the simplex before calling.",
+            stacklevel=3,
+        )
 
 
 def _bc(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
@@ -112,6 +130,7 @@ def classical_structural_keystoneness(
     """
     if qtst.shape[0] != len(sample_id) or qtst.shape[0] != len(species_id):
         raise ValueError("qtst rows must match len(sample_id) == len(species_id)")
+    _warn_if_not_compositional(ptrn)
 
     n_pairs = qtst.shape[0]
     rows = []
@@ -173,6 +192,7 @@ def functional_keystoneness(
     """
     if qtst.shape[0] != len(sample_id) or qtst.shape[0] != len(species_id):
         raise ValueError("qtst rows must match len(sample_id) == len(species_id)")
+    _warn_if_not_compositional(ptrn)
 
     n_species = qtrn.shape[1]
     G = _orient_gcn(gcn, n_species)
