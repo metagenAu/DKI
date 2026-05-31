@@ -11,7 +11,7 @@ import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -87,6 +87,14 @@ class DKIData:
     # ``None`` when no read-depth filter was applied (all columns/rows kept).
     kept_samples: Optional[np.ndarray] = None
     kept_taxa: Optional[np.ndarray] = None
+    # Multi-community provenance (set by ``load_multi_community_dataset``; ``None``
+    # for the single-matrix ``load_dataset``). ``community_index`` is a length
+    # ``n_species`` int array giving, for each row of the combined species axis,
+    # the 0-based community it came from; ``community_names`` labels those
+    # communities. They let downstream code (e.g. keystoneness) map a combined
+    # species index back to its originating community.
+    community_index: Optional[np.ndarray] = None
+    community_names: Optional[list] = None
 
     def to(self, device: torch.device) -> "DKIData":
         return DKIData(
@@ -101,6 +109,8 @@ class DKIData:
             n_species=self.n_species,
             kept_samples=self.kept_samples,
             kept_taxa=self.kept_taxa,
+            community_index=self.community_index,
+            community_names=self.community_names,
         )
 
 
@@ -133,15 +143,62 @@ def load_dataset(
         stay aligned. ``DKIData.kept_samples`` / ``kept_taxa`` record the
         original indices that survived.
     """
-    rng = np.random.default_rng(seed)
     ptrain_path = _resolve_path(data_dir, "Ptrain.csv")
     if not ptrain_path.exists():
         raise FileNotFoundError(f"Missing {ptrain_path}")
 
     P = np.loadtxt(ptrain_path, delimiter=",")
 
+    P_test: Optional[np.ndarray] = None
+    Z_test: Optional[np.ndarray] = None
+    ptest_path = _resolve_path(data_dir, "Ptest.csv")
+    ztest_path = _resolve_path(data_dir, "Ztest.csv")
+    if ptest_path.exists():
+        P_test = np.loadtxt(ptest_path, delimiter=",")
+        if test_uses_z and ztest_path.exists():
+            Z_test = np.loadtxt(ztest_path, delimiter=",")
+
+    return _assemble_dataset(
+        P,
+        P_test,
+        Z_test,
+        val_fraction=val_fraction,
+        seed=seed,
+        test_uses_z=test_uses_z,
+        min_reads=min_reads,
+        log_prefix="load_dataset",
+    )
+
+
+def _assemble_dataset(
+    P: np.ndarray,
+    P_test: Optional[np.ndarray],
+    Z_test: Optional[np.ndarray],
+    *,
+    val_fraction: float,
+    seed: int,
+    test_uses_z: bool,
+    min_reads: float,
+    community_index: Optional[np.ndarray] = None,
+    community_names: Optional[List[str]] = None,
+    log_prefix: str = "load_dataset",
+) -> DKIData:
+    """Build a :class:`DKIData` from already-loaded raw count matrices.
+
+    Shared by :func:`load_dataset` (single matrix) and
+    :func:`load_multi_community_dataset` (several communities row-stacked into
+    one matrix). All matrices are ``(n_species, n_samples)`` raw counts /
+    relative abundances; normalisation and the train/val split happen here so
+    both entry points behave identically once the species axis is assembled.
+
+    ``community_index`` (length ``n_species``) is carried through the read-depth
+    taxa filter so it always lines up with the model's species dimension.
+    """
+    rng = np.random.default_rng(seed)
+
     kept_samples: Optional[np.ndarray] = None
     kept_taxa: Optional[np.ndarray] = None
+    taxa_mask: Optional[np.ndarray] = None
     if min_reads and min_reads > 0:
         if np.allclose(P.sum(axis=0), 1.0, atol=1e-3):
             warnings.warn(
@@ -155,8 +212,10 @@ def load_dataset(
         P, sample_mask, taxa_mask = filter_low_depth(P, min_reads)
         kept_samples = np.nonzero(sample_mask)[0]
         kept_taxa = np.nonzero(taxa_mask)[0]
+        if community_index is not None:
+            community_index = community_index[taxa_mask]
         print(
-            f"[load_dataset] read-depth filter (min_reads={min_reads:g}): "
+            f"[{log_prefix}] read-depth filter (min_reads={min_reads:g}): "
             f"kept {kept_samples.size}/{n0_samples} samples, "
             f"{kept_taxa.size}/{n0_taxa} taxa (dropped "
             f"{n0_samples - kept_samples.size} shallow samples, "
@@ -174,11 +233,8 @@ def load_dataset(
 
     p_test: Optional[torch.Tensor] = None
     z_test: Optional[torch.Tensor] = None
-    ptest_path = _resolve_path(data_dir, "Ptest.csv")
-    ztest_path = _resolve_path(data_dir, "Ztest.csv")
-    if ptest_path.exists():
-        P_test = np.loadtxt(ptest_path, delimiter=",")
-        if kept_taxa is not None:
+    if P_test is not None:
+        if taxa_mask is not None:
             if P_test.shape[0] != len(taxa_mask):
                 raise ValueError(
                     f"Ptest has {P_test.shape[0]} taxa rows but Ptrain had "
@@ -187,9 +243,8 @@ def load_dataset(
                 )
             P_test = P_test[taxa_mask, :]
         p_test, z_from_p = process_data(P_test)
-        if test_uses_z and ztest_path.exists():
-            Z_test = np.loadtxt(ztest_path, delimiter=",")
-            if kept_taxa is not None:
+        if test_uses_z and Z_test is not None:
+            if taxa_mask is not None:
                 Z_test = Z_test[taxa_mask, :]
             _, z_test = process_data(Z_test)
         else:
@@ -207,4 +262,202 @@ def load_dataset(
         n_species=n_species,
         kept_samples=kept_samples,
         kept_taxa=kept_taxa,
+        community_index=community_index,
+        community_names=community_names,
+    )
+
+
+def _load_matrix(path: Union[str, Path]) -> np.ndarray:
+    """Load a CSV with ``np.loadtxt``; a single row/column comes back 1-D."""
+    return np.loadtxt(path, delimiter=",")
+
+
+def stack_communities(
+    matrices: Sequence[np.ndarray], what: str = "matrices"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Row-stack per-community ``(n_species, n_samples)`` matrices on a shared sample axis.
+
+    Each input matrix is one community (e.g. bacteria / fungi / archaea) profiled
+    on the **same** samples, so every matrix must have the same number of columns
+    in the same order. The species rows are concatenated, fusing the communities
+    into a single ``(Σ n_speciesᵢ, n_samples)`` matrix that DKI treats as one
+    community under a single shared assembly rule.
+
+    A single-species community loads from CSV as a 1-D array; it is interpreted
+    as one ``(1, n_samples)`` row by matching the shared sample-column count
+    (which also disambiguates it from a single-sample column vector).
+
+    Returns ``(combined, community_index)`` where ``community_index[r]`` is the
+    0-based community that contributed row ``r`` of ``combined``.
+    """
+    matrices = list(matrices)
+    if not matrices:
+        raise ValueError(f"need at least one community matrix, got 0 ({what})")
+
+    # The shared sample-column count comes from any genuinely 2-D community; a
+    # 1-D community (single species) is then read as one row over those columns.
+    n_cols: Optional[int] = next(
+        (m.shape[1] for m in matrices if m.ndim == 2), None
+    )
+    if n_cols is None:
+        n_cols = matrices[0].shape[0]   # all single-species: length is the sample count
+
+    fixed: List[np.ndarray] = []
+    for i, m in enumerate(matrices):
+        if m.ndim == 1:
+            if m.shape[0] != n_cols:
+                raise ValueError(
+                    f"{what}[{i}] is 1-D with {m.shape[0]} entries, which does not "
+                    f"match the {n_cols} shared samples; a single-species community "
+                    "must have one value per shared sample."
+                )
+            m = m.reshape(1, n_cols)
+        elif m.shape[1] != n_cols:
+            raise ValueError(
+                f"all communities must share the same samples (columns): {what} has a "
+                f"community with {n_cols} sample columns but {what}[{i}] has "
+                f"{m.shape[1]}. Multi-community DKI stacks species rows on a shared "
+                "sample axis, so every community must be profiled on the same samples "
+                "in the same order."
+            )
+        fixed.append(m)
+    combined = np.vstack(fixed)
+    community_index = np.concatenate(
+        [np.full(m.shape[0], i, dtype=int) for i, m in enumerate(fixed)]
+    )
+    return combined, community_index
+
+
+def _stack_test_matrices(
+    paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]],
+    n_species: int,
+    n_communities: int,
+    what: str,
+) -> Optional[np.ndarray]:
+    """Resolve a Ptest/Ztest argument to a combined ``(n_species, n_pairs)`` matrix.
+
+    Accepts either a single already-combined CSV path, or a sequence of one
+    per-community CSV (parallel to ``train_paths``) that is row-stacked the same
+    way as the training matrices. ``None`` means "no test set".
+    """
+    if paths is None:
+        return None
+    if isinstance(paths, (str, Path)):
+        mat = _load_matrix(paths)
+        if mat.ndim == 1:
+            # A single perturbation column loads 1-D; it must span all species.
+            if mat.shape[0] != n_species:
+                raise ValueError(
+                    f"{what} is 1-D with {mat.shape[0]} entries but the combined "
+                    f"training matrix has {n_species} species; a single combined "
+                    f"{what} column must cover all communities' species."
+                )
+            mat = mat.reshape(n_species, 1)
+        if mat.shape[0] != n_species:
+            raise ValueError(
+                f"{what} has {mat.shape[0]} species rows but the combined training "
+                f"matrix has {n_species}; a single combined {what} must cover all "
+                "communities' species in the same row order."
+            )
+        return mat
+    paths = list(paths)
+    if len(paths) != n_communities:
+        raise ValueError(
+            f"{what} must have one entry per community (parallel to train_paths): "
+            f"expected {n_communities}, got {len(paths)}."
+        )
+    combined, _ = stack_communities([_load_matrix(p) for p in paths], what=what)
+    if combined.shape[0] != n_species:
+        raise ValueError(
+            f"{what} stacks to {combined.shape[0]} species rows but the combined "
+            f"training matrix has {n_species}; each community's {what} must have the "
+            "same number of species rows as its Ptrain."
+        )
+    return combined
+
+
+def load_multi_community_dataset(
+    train_paths: Sequence[Union[str, Path]],
+    test_paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
+    ztest_paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
+    community_names: Optional[Sequence[str]] = None,
+    val_fraction: float = 0.2,
+    seed: int = 0,
+    test_uses_z: bool = True,
+    min_reads: float = 0.0,
+) -> DKIData:
+    """Load N community matrices sharing the same samples and fuse them into one model.
+
+    Each path in ``train_paths`` is a ``(n_species, n_samples)`` CSV for one
+    community (e.g. bacteria, fungi, archaea) measured on the **same** samples.
+    The species rows are stacked into a single ``(Σ n_speciesᵢ, n_samples)``
+    matrix and handed to the ordinary DKI pipeline, so a single shared assembly
+    rule ``f`` is learned across all communities — letting the model capture
+    cross-community interactions and rank keystoneness on the combined species set.
+
+    Parameters
+    ----------
+    train_paths
+        One Ptrain-style CSV per community. All must have the same number of
+        sample columns, in the same order.
+    test_paths, ztest_paths
+        Optional Ptest / Ztest leave-one-species-out matrices. Each may be a
+        single already-combined CSV (covering all communities' species in the
+        same row order as the stacked training matrix) **or** a sequence of one
+        CSV per community (parallel to ``train_paths``), which is row-stacked the
+        same way. ``ztest_paths`` is only used when ``test_uses_z`` is True.
+    community_names
+        Optional labels for the communities (parallel to ``train_paths``);
+        defaults to the file stems. Recorded on ``DKIData.community_names`` and,
+        together with ``DKIData.community_index``, lets downstream code map a
+        combined species index back to its originating community.
+    val_fraction, seed, test_uses_z, min_reads
+        Same meaning as in :func:`load_dataset`. The read-depth filter, when
+        enabled, runs on the **combined** matrix (a sample is judged by its total
+        reads across all communities) and its taxa mask is applied to
+        ``community_index`` so provenance stays aligned with the model dimension.
+    """
+    train_paths = list(train_paths)
+    if not train_paths:
+        raise FileNotFoundError(
+            "train_paths is empty; pass one Ptrain-style CSV per community."
+        )
+    for p in train_paths:
+        if not Path(p).exists():
+            raise FileNotFoundError(f"Missing community training matrix: {p}")
+
+    P, community_index = stack_communities(
+        [_load_matrix(p) for p in train_paths], what="train_paths"
+    )
+    n_species = P.shape[0]
+    n_communities = len(train_paths)
+
+    if community_names is None:
+        community_names = [Path(p).stem for p in train_paths]
+    else:
+        community_names = list(community_names)
+        if len(community_names) != n_communities:
+            raise ValueError(
+                f"community_names has {len(community_names)} entries but there are "
+                f"{n_communities} communities (train_paths)."
+            )
+
+    P_test = _stack_test_matrices(test_paths, n_species, n_communities, "Ptest")
+    Z_test = (
+        _stack_test_matrices(ztest_paths, n_species, n_communities, "Ztest")
+        if test_uses_z
+        else None
+    )
+
+    return _assemble_dataset(
+        P,
+        P_test,
+        Z_test,
+        val_fraction=val_fraction,
+        seed=seed,
+        test_uses_z=test_uses_z,
+        min_reads=min_reads,
+        community_index=community_index,
+        community_names=community_names,
+        log_prefix="load_multi_community_dataset",
     )

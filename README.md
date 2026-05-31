@@ -47,6 +47,53 @@ Design notes pinned by the project:
   null z-score and Shapley results land as alternatives, not
   replacements.
 
+## Multiple communities, one model (N matrices → fused species axis)
+
+The default pipeline trains on a single `Ptrain` matrix. When you have
+several communities profiled on the **same samples** — e.g. bacteria,
+fungi, and archaea measured on one set of fecal samples — you can fuse
+them into a single model with `load_multi_community_dataset`. Each
+community is a `(n_speciesᵢ, n_samples)` matrix; the species rows are
+stacked on the shared sample axis into one `(Σ n_speciesᵢ, n_samples)`
+matrix, which the unchanged model/training/keystoneness code then treats
+as one community. Because per-sample normalisation is applied **after**
+stacking, the communities share one simplex and one assembly rule `f`,
+so the model can learn **cross-community (e.g. inter-kingdom)
+interactions** and rank keystoneness on the combined species set.
+
+```python
+from dki import load_multi_community_dataset
+from dki.train import TrainConfig, train
+
+data = load_multi_community_dataset(
+    train_paths=["bacteria.csv", "fungi.csv", "archaea.csv"],
+    # optional leave-one-out test sets — one combined CSV, or one per community:
+    test_paths="Ptest.csv", ztest_paths="Ztest.csv",
+    community_names=["bacteria", "fungi", "archaea"],  # defaults to file stems
+)
+model, result, data = train(TrainConfig(), data=data)
+
+# provenance back to each originating community:
+data.n_species        # Σ speciesᵢ
+data.community_index  # length-n_species array: which community each row came from
+data.community_names  # ["bacteria", "fungi", "archaea"]
+```
+
+Requirements and behaviour:
+
+* Every community matrix must have the **same number of sample columns,
+  in the same order** (they're the same physical samples). A clear
+  `ValueError` is raised otherwise.
+* A single-species community (a 1-row CSV) is handled — it loads 1-D and
+  is read as one row over the shared samples.
+* `min_reads` read-depth QC, when enabled, runs on the **combined**
+  matrix (a sample is judged by its total reads across all communities),
+  and its taxa filter is applied to `community_index` so provenance stays
+  aligned with the model's species dimension.
+* This keeps the **metacommunity assumption** intact: still one shared
+  `f`, only `z` varies. The communities are fused into a single larger
+  community, not given community-specific parameters.
+
 A Colab notebook that runs the whole pipeline end-to-end lives at
 [`notebooks/dki_colab.ipynb`](notebooks/dki_colab.ipynb)
 ([open in Colab](https://colab.research.google.com/github/metagenAu/DKI/blob/claude/peaceful-goodall-4AC8l/notebooks/dki_colab.ipynb)).
