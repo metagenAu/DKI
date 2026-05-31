@@ -261,6 +261,7 @@ def null_model_keystoneness(
     species_id: np.ndarray,
     n_null: int = 50,
     seed: int = 0,
+    batch_size: int = 256,
 ) -> pd.DataFrame:
     """Phase-4 null-model z-score calibration of structural keystoneness.
 
@@ -296,6 +297,9 @@ def null_model_keystoneness(
     seed
         Seeds tie-breaking when more candidates than ``n_null`` share the same
         abundance distance.
+    batch_size
+        Number of assemblages pushed through ``predict_fn`` per forward pass.
+        Lower this if you hit CUDA out-of-memory errors on large datasets.
 
     Returns
     -------
@@ -313,11 +317,18 @@ def null_model_keystoneness(
     samples0 = np.asarray(sample_id, dtype=int) - 1
     species0 = np.asarray(species_id, dtype=int) - 1
 
-    # Predicted full-community composition for each sample that appears.
+    # Predicted full-community composition for each sample that appears,
+    # batched to bound peak GPU memory.
     unique_samples = np.unique(samples0)
-    q_with_all = predict_fn(z_all[torch.as_tensor(unique_samples, device=device)])
+    z_with = z_all[torch.as_tensor(unique_samples, device=device)]
+    with_chunks = []
+    for start in range(0, z_with.shape[0], batch_size):
+        with torch.no_grad():
+            out = predict_fn(z_with[start:start + batch_size])
+        with_chunks.append(out.detach().cpu().numpy())
+    q_with_all = np.concatenate(with_chunks, axis=0)
     q_with_map = {
-        int(s): q_with_all[i].detach().cpu().numpy()
+        int(s): q_with_all[i]
         for i, s in enumerate(unique_samples)
     }
 
@@ -347,7 +358,15 @@ def null_model_keystoneness(
             loo_rows.append(_loo_assemblage(z_s, int(c)))
         pair_meta.append((focal_offset, null_offsets, chosen))
 
-    q_loo = predict_fn(torch.stack(loo_rows, dim=0)).detach().cpu().numpy()
+    # Run the leave-one-out predictions in chunks so the GPU never has to hold
+    # the full (n_pairs * (1 + n_null)) batch at once, which OOMs on large runs.
+    loo_stack = torch.stack(loo_rows, dim=0)
+    chunks = []
+    for start in range(0, loo_stack.shape[0], batch_size):
+        batch = loo_stack[start:start + batch_size]
+        with torch.no_grad():
+            chunks.append(predict_fn(batch).detach().cpu().numpy())
+    q_loo = np.concatenate(chunks, axis=0)
 
     rows = []
     for i in range(n_pairs):
