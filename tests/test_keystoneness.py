@@ -119,3 +119,20 @@ def test_keystoneness_table_columns():
     ]
     # Identity GCN => functional matches structural inside the combined table too.
     assert np.allclose(with_gcn["func_pred"], with_gcn["str_pred"])
+
+
+def test_compositional_input_gives_nonnegative_keystoneness():
+    """k = BC * (1-p) with p in [0,1] can never be negative."""
+    qtrn, qtst, ptrn, ptst, sid, spid = _toy_inputs()
+    ks = classical_structural_keystoneness(qtrn, qtst, ptrn, ptst, sid, spid)
+    assert (ks["k_pred"] >= 0).all()
+
+
+def test_warns_when_ptrn_not_compositional():
+    """Counts/percentages (entries > 1) trip the (1-p) sign and must warn."""
+    qtrn, qtst, ptrn, ptst, sid, spid = _toy_inputs()
+    ptrn_counts = ptrn * 1000.0          # raw counts, columns no longer sum to 1
+    with pytest.warns(UserWarning, match="not per-sample relative abundance"):
+        ks = classical_structural_keystoneness(qtrn, qtst, ptrn_counts, ptst, sid, spid)
+    # And the symptom the warning is about: negative keystoneness.
+    assert (ks["k_pred"] < 0).any()
