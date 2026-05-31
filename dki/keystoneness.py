@@ -48,6 +48,34 @@ def _renormalise_without(q: np.ndarray, idx: int) -> np.ndarray:
     return out
 
 
+def _project_function(q: np.ndarray, gcn: np.ndarray) -> np.ndarray:
+    """Project a composition onto function space and renormalise to the simplex.
+
+    Mirrors the R ``q %*% GCN`` step followed by ``f / sum(f)``. ``gcn`` is
+    ``(n_species, n_functions)``.
+    """
+    f = q @ gcn
+    s = f.sum()
+    if s > 0:
+        f = f / s
+    return f
+
+
+def _orient_gcn(gcn: np.ndarray, n_species: int) -> np.ndarray:
+    """Return ``gcn`` as ``(n_species, n_functions)``, transposing if needed."""
+    gcn = np.asarray(gcn, dtype=float)
+    if gcn.ndim != 2:
+        raise ValueError(f"GCN must be 2-D, got shape {gcn.shape}")
+    if gcn.shape[0] == n_species:
+        return gcn
+    if gcn.shape[1] == n_species:
+        return gcn.T
+    raise ValueError(
+        f"GCN shape {gcn.shape} has no axis matching n_species={n_species}; "
+        "expected (n_species, n_functions) or its transpose."
+    )
+
+
 def classical_structural_keystoneness(
     qtrn: np.ndarray,
     qtst: np.ndarray,
@@ -111,6 +139,98 @@ def classical_structural_keystoneness(
             "k_true": bc_true * (1.0 - p_s),
         })
     return pd.DataFrame(rows)
+
+
+def functional_keystoneness(
+    qtrn: np.ndarray,
+    qtst: np.ndarray,
+    ptrn: np.ndarray,
+    ptst: np.ndarray,
+    gcn: np.ndarray,
+    sample_id: np.ndarray,
+    species_id: np.ndarray,
+) -> pd.DataFrame:
+    """Functional keystoneness — Python port of the ``GCN`` half of the R script.
+
+    Where structural keystoneness measures the Bray–Curtis shift in *composition*
+    after removing a species, functional keystoneness measures the shift in the
+    community's *function* profile. Each composition ``q`` is projected onto
+    function space via the gene-copy-number matrix (``f = q @ GCN``), renormalised
+    to the simplex, and the BC shift is taken there::
+
+        kf = BC(f(q_with_renorm), f(q_without)) * (1 - p_species_in_sample)
+
+    Parameters mirror :func:`classical_structural_keystoneness`, with one addition:
+
+    gcn
+        Gene-copy-number / trait matrix. Accepted as ``(n_species, n_functions)``
+        or its transpose (auto-detected); any other shape raises ``ValueError``.
+
+    Returns
+    -------
+    DataFrame with ``sample``, ``species`` (1-indexed), ``p_species``,
+    ``kf_pred`` and ``kf_true``.
+    """
+    if qtst.shape[0] != len(sample_id) or qtst.shape[0] != len(species_id):
+        raise ValueError("qtst rows must match len(sample_id) == len(species_id)")
+
+    n_species = qtrn.shape[1]
+    G = _orient_gcn(gcn, n_species)
+
+    rows = []
+    for i in range(qtst.shape[0]):
+        s = int(sample_id[i]) - 1
+        sp = int(species_id[i]) - 1
+
+        q_with = qtrn[s]
+        q_renorm_pred = _renormalise_without(q_with, sp)
+        f_before_pred = _project_function(q_renorm_pred, G)
+        f_after_pred = _project_function(qtst[i], G)
+        bc_pred = _bc(f_before_pred, f_after_pred)
+
+        p_with = ptrn[:, s]
+        p_renorm_true = _renormalise_without(p_with, sp)
+        f_before_true = _project_function(p_renorm_true, G)
+        f_after_true = _project_function(ptst[:, i], G)
+        bc_true = _bc(f_before_true, f_after_true)
+
+        p_s = float(p_with[sp])
+        rows.append({
+            "sample": s + 1,
+            "species": sp + 1,
+            "p_species": p_s,
+            "kf_pred": bc_pred * (1.0 - p_s),
+            "kf_true": bc_true * (1.0 - p_s),
+        })
+    return pd.DataFrame(rows)
+
+
+def keystoneness_table(
+    qtrn: np.ndarray,
+    qtst: np.ndarray,
+    ptrn: np.ndarray,
+    ptst: np.ndarray,
+    sample_id: np.ndarray,
+    species_id: np.ndarray,
+    gcn: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Combined structural + functional keystoneness, matching the R output.
+
+    Returns a single DataFrame with ``sample``, ``species``, ``p_species`` and the
+    R script's four keystone columns ``str_pred``, ``func_pred``, ``str_true``,
+    ``func_true``. When ``gcn`` is ``None`` the functional columns are omitted
+    (structural keystoneness needs no trait matrix).
+    """
+    s = classical_structural_keystoneness(
+        qtrn, qtst, ptrn, ptst, sample_id, species_id
+    ).rename(columns={"k_pred": "str_pred", "k_true": "str_true"})
+    if gcn is None:
+        return s
+    f = functional_keystoneness(qtrn, qtst, ptrn, ptst, gcn, sample_id, species_id)
+    s["func_pred"] = f["kf_pred"].to_numpy()
+    s["func_true"] = f["kf_true"].to_numpy()
+    return s[["sample", "species", "p_species",
+              "str_pred", "func_pred", "str_true", "func_true"]]
 
 
 def null_model_keystoneness(
