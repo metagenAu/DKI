@@ -115,13 +115,21 @@ def integrate_set(func, z, t, batched):
 
     ``batched=False`` reproduces the original per-sample loop; ``batched=True``
     runs a single ``odeint`` over the stacked state.
+
+    Both paths integrate with **fixed-step Euler** over the ``t`` grid (dt set
+    by its spacing), as the original recipe intended. Passing ``method`` here is
+    deliberate: ``odeint``'s default is adaptive ``dopri5``, whose step
+    controller shrinks toward underflow on these unconstrained-weight replicator
+    dynamics and builds an unbounded backprop graph -- harmless in CPU RAM (where
+    the original ran) but enough to exhaust a GPU. Fixed-step Euler keeps the
+    grid at the documented 10,000 steps and bounds the graph.
     """
     if batched:
-        traj = odeint(func, z, t)
+        traj = odeint(func, z, t, method="euler")
         return traj[-1]
     rows = []
     for i in range(z.size(dim=0)):
-        traj = odeint(func, z[i].unsqueeze(dim=0), t)
+        traj = odeint(func, z[i].unsqueeze(dim=0), t, method="euler")
         rows.append(traj[-1].reshape(-1))
     return torch.stack(rows, dim=0)
 
