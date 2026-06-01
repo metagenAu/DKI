@@ -341,16 +341,19 @@ def _resolve_community_weights(
 ) -> Optional[np.ndarray]:
     """Turn the ``community_weights`` argument into a length-N array summing to 1.
 
-    ``None`` -> ``None`` (no weighting; raw shared-scale stacking).
+    ``None`` / ``"raw"`` -> ``None`` (no weighting; raw shared-scale stacking).
     ``"equal"`` -> uniform ``1/N``.
     A sequence -> normalised to sum 1 (must be length N, non-negative, not all 0).
     """
     if community_weights is None:
         return None
     if isinstance(community_weights, str):
+        if community_weights == "raw":
+            return None
         if community_weights != "equal":
             raise ValueError(
-                f"community_weights string must be 'equal', got {community_weights!r}."
+                "community_weights string must be 'equal' or 'raw', got "
+                f"{community_weights!r}."
             )
         return np.full(n_communities, 1.0 / n_communities)
     w = np.asarray(list(community_weights), dtype=float)
@@ -446,7 +449,7 @@ def load_multi_community_dataset(
     test_paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
     ztest_paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
     community_names: Optional[Sequence[str]] = None,
-    community_weights: Optional[Union[str, Sequence[float]]] = None,
+    community_weights: Optional[Union[str, Sequence[float]]] = "equal",
     val_fraction: float = 0.2,
     seed: int = 0,
     test_uses_z: bool = True,
@@ -484,17 +487,18 @@ def load_multi_community_dataset(
         own sequencing total, so the data carries **no shared scale** between
         them and the true between-community proportions are not identifiable.
 
-        * ``None`` (default) — concatenate the raw matrices and renormalise
-          jointly. Correct only when all communities came from **one** library
-          (one PCR split by taxonomy). For separate libraries this lets
-          sequencing depth decide the between-community ratio, which is
-          meaningless; a warning is emitted when ``N > 1``.
-        * ``"equal"`` — normalise each community to a within-marker composition,
-          then give every community an equal ``1/N`` share of each sample's
-          joint composition. The honest default for separate markers: an
-          explicit, depth-independent assumption.
+        * ``"equal"`` (**default**) — normalise each community to a within-marker
+          composition, then give every community an equal ``1/N`` share of each
+          sample's joint composition. The honest default for separate markers:
+          an explicit, depth-independent assumption.
         * a sequence of ``N`` non-negative weights — as ``"equal"`` but with a
-          chosen per-community mass (normalised to sum 1).
+          chosen per-community mass (normalised to sum 1). If you have absolute
+          per-marker totals (qPCR load, spike-ins, flow), pass those here.
+        * ``"raw"`` / ``None`` — concatenate the raw matrices and renormalise
+          jointly, with no per-marker rebalancing. Correct only when all
+          communities came from **one** library (one PCR split by taxonomy);
+          for separate libraries this lets sequencing depth decide the
+          between-community ratio, which is meaningless.
 
         Either way, **within-community keystoneness rankings are unaffected by
         the choice; only cross-community comparisons depend on it** — report the
@@ -545,7 +549,8 @@ def load_multi_community_dataset(
             raise ValueError(
                 "community_weights operates on relative compositions and is "
                 "incompatible with min_reads (read-depth QC needs raw counts). "
-                "Filter each community's counts upstream, then fuse with weights."
+                "Do read-depth QC on the raw per-marker counts upstream, or pass "
+                "community_weights='raw' if these came from one library."
             )
         P = _apply_community_weights(P, community_index, weights)
         # Ptest is the observed after-removal composition that predictions are
@@ -553,17 +558,6 @@ def load_multi_community_dataset(
         # presence-only (binarised downstream), so weighting it is a no-op — skip.
         if P_test is not None:
             P_test = _apply_community_weights(P_test, community_index, weights)
-    elif n_communities > 1:
-        warnings.warn(
-            f"Fusing {n_communities} communities by raw concatenation "
-            "(community_weights=None). This is only valid if they came from ONE "
-            "amplicon library (one marker split by taxonomy). For SEPARATELY "
-            "amplified markers (e.g. 16S + ITS) there is no shared scale, so the "
-            "between-community ratio would be driven by sequencing depth. Pass "
-            "community_weights='equal' (or explicit weights) to make the "
-            "assumption explicit.",
-            stacklevel=2,
-        )
 
     return _assemble_dataset(
         P,

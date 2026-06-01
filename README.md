@@ -106,37 +106,38 @@ true between-community proportions are **not identifiable from the data**.
 Stacking raw reads and renormalising would let sequencing depth / primer
 bias / copy-number variation decide the cross-kingdom ratio — an artifact.
 
-Two situations:
+`load_multi_community_dataset` defaults to **equal mass per marker** to
+keep this honest: each marker is normalised to a within-marker
+composition, then given an equal `1/N` share of every sample's joint
+composition. This makes the cross-community weighting an **explicit,
+depth-independent assumption** instead of an accident of sequencing depth.
 
-* **One library split by taxonomy** (one PCR, then separated into tables) —
-  the groups share one real denominator, so the default raw fusion
-  (`community_weights=None`) re-merges the true composition correctly.
-* **Separate marker libraries** — there is no common scale. Use
-  `community_weights` to make the cross-community weighting an **explicit
-  assumption** instead of an accident of depth:
+```python
+data = load_multi_community_dataset(
+    ["bacteria.csv", "fungi.csv", "archaea.csv"],
+    # community_weights="equal" is the default
+    # community_weights=[0.7, 0.2, 0.1]  # or a chosen / qPCR-derived mass split
+    # community_weights="raw"            # only for ONE library split by taxonomy
+)
+```
 
-  ```python
-  data = load_multi_community_dataset(
-      ["bacteria.csv", "fungi.csv", "archaea.csv"],
-      community_weights="equal",        # each marker = 1/N of the joint mass
-      # community_weights=[0.7, 0.2, 0.1]  # or a chosen mass split
-  )
-  ```
+The `community_weights` options:
 
-  Each marker is first normalised to a within-marker composition, then
-  given its declared share of every sample's joint composition.
-  **Within-marker keystoneness rankings are unaffected** by this choice;
-  **only cross-marker comparisons depend on it**, so report the weights
-  you used. If you ever obtain absolute totals per marker (qPCR load,
-  spike-ins, flow cytometry), pass those normalised totals as
-  `community_weights` to recover biologically meaningful proportions.
+* `"equal"` (**default**) — equal `1/N` mass per marker.
+* a sequence of `N` weights — a chosen per-community mass (normalised to
+  sum 1). If you ever obtain absolute totals per marker (qPCR load,
+  spike-ins, flow cytometry), pass those here to recover biologically
+  meaningful proportions.
+* `"raw"` / `None` — raw concatenation with no rebalancing. Correct **only**
+  when all communities came from **one** library (one PCR split by
+  taxonomy), where they already share a real denominator.
 
-`load_multi_community_dataset` **warns** whenever it fuses more than one
-community with the default raw scaling, since that is only valid for the
-one-library case. `community_weights` operates on relative compositions
-and so cannot be combined with `min_reads` (do read-depth QC on the raw
-per-marker counts upstream). The applied weights are recorded on
-`DKIData.community_weights`.
+**Within-marker keystoneness rankings are unaffected by this choice; only
+cross-marker comparisons depend on it** — so report the weights you used.
+Weighting operates on relative compositions and so cannot be combined with
+`min_reads` (do read-depth QC on the raw per-marker counts upstream, or
+pass `community_weights="raw"`). The applied weights are recorded on
+`DKIData.community_weights` (`None` for raw mode).
 
 A Colab notebook that runs the whole pipeline end-to-end lives at
 [`notebooks/dki_colab.ipynb`](notebooks/dki_colab.ipynb)

@@ -86,7 +86,9 @@ def test_multi_community_matches_a_manually_stacked_single_load(tmp_path):
         _write(tmp_path, "B.csv", _B),
         _write(tmp_path, "C.csv", _C),
     ]
-    multi = load_multi_community_dataset(paths, val_fraction=0.25, seed=3)
+    multi = load_multi_community_dataset(
+        paths, community_weights="raw", val_fraction=0.25, seed=3
+    )
 
     np.savetxt(tmp_path / "Ptrain.csv", np.vstack([_A, _B, _C]), delimiter=",")
     single = load_dataset(str(tmp_path), val_fraction=0.25, seed=3)
@@ -146,10 +148,31 @@ _PB = np.array([[2.0, 2.0, 1.0], [6.0, 1.0, 3.0]])     # 2 species
 _PC = np.array([[5.0, 2.0, 4.0]])                       # 1 species
 
 
-def test_raw_fusion_warns_for_multiple_communities(tmp_path):
+def test_default_is_equal_weighting(tmp_path):
+    # No community_weights argument: each marker should get an equal 1/N mass.
+    paths = [
+        _write(tmp_path, "A.csv", _PA),
+        _write(tmp_path, "B.csv", _PB),
+        _write(tmp_path, "C.csv", _PC),
+    ]
+    data = load_multi_community_dataset(paths, seed=0)
+    np.testing.assert_allclose(data.community_weights, [1 / 3, 1 / 3, 1 / 3])
+    p = data.p_all.numpy()
+    ci = data.community_index
+    for c in range(3):
+        np.testing.assert_allclose(
+            p[:, ci == c].sum(axis=1), np.full(3, 1 / 3), atol=1e-5
+        )
+
+
+def test_raw_mode_opts_out_of_weighting(tmp_path):
     paths = [_write(tmp_path, "A.csv", _PA), _write(tmp_path, "B.csv", _PB)]
-    with pytest.warns(UserWarning, match="no shared scale"):
-        load_multi_community_dataset(paths, seed=0)   # community_weights=None
+    data = load_multi_community_dataset(paths, community_weights="raw", seed=0)
+    assert data.community_weights is None
+    # raw stacking == manually vstacked single load
+    np.savetxt(tmp_path / "Ptrain.csv", np.vstack([_PA, _PB]), delimiter=",")
+    single = load_dataset(str(tmp_path), seed=0)
+    np.testing.assert_allclose(data.p_all.numpy(), single.p_all.numpy(), atol=1e-6)
 
 
 def test_equal_weighting_gives_each_community_equal_mass(tmp_path):
@@ -223,7 +246,10 @@ def test_read_depth_filter_remaps_community_index(tmp_path):
     b = np.array([[2.0, 5000.0, 1000.0, 2000.0],
                   [0.0, 0.0, 0.0, 0.0]])          # taxon empty among deep samples
     paths = [_write(tmp_path, "A.csv", a), _write(tmp_path, "B.csv", b)]
-    data = load_multi_community_dataset(paths, val_fraction=0.5, seed=0, min_reads=1000)
+    # read-depth QC needs raw counts, so opt out of compositional weighting
+    data = load_multi_community_dataset(
+        paths, community_weights="raw", val_fraction=0.5, seed=0, min_reads=1000
+    )
 
     # community B's second taxon vanishes -> 3 species survive, index stays aligned
     assert data.n_species == 3
