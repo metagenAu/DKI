@@ -137,6 +137,85 @@ def test_test_matrix_species_mismatch_raises(tmp_path):
         load_multi_community_dataset(train, test_paths=wrong, seed=0)
 
 
+# --- compositional weighting for separately-amplified markers ----------------
+
+# Three communities, all present in all 3 samples (so equal weighting gives
+# each an exact 1/N mass share with no absent-community rescaling).
+_PA = np.array([[3.0, 1.0, 2.0], [1.0, 4.0, 2.0]])     # 2 species
+_PB = np.array([[2.0, 2.0, 1.0], [6.0, 1.0, 3.0]])     # 2 species
+_PC = np.array([[5.0, 2.0, 4.0]])                       # 1 species
+
+
+def test_raw_fusion_warns_for_multiple_communities(tmp_path):
+    paths = [_write(tmp_path, "A.csv", _PA), _write(tmp_path, "B.csv", _PB)]
+    with pytest.warns(UserWarning, match="no shared scale"):
+        load_multi_community_dataset(paths, seed=0)   # community_weights=None
+
+
+def test_equal_weighting_gives_each_community_equal_mass(tmp_path):
+    paths = [
+        _write(tmp_path, "A.csv", _PA),
+        _write(tmp_path, "B.csv", _PB),
+        _write(tmp_path, "C.csv", _PC),
+    ]
+    data = load_multi_community_dataset(paths, community_weights="equal", seed=0)
+
+    np.testing.assert_allclose(data.community_weights, [1 / 3, 1 / 3, 1 / 3])
+    p = data.p_all.numpy()                     # (3 samples, 5 species)
+    ci = data.community_index
+    for c in range(3):
+        block_mass = p[:, ci == c].sum(axis=1)
+        np.testing.assert_allclose(block_mass, np.full(3, 1 / 3), atol=1e-5)
+    # whole composition still sums to 1 per sample
+    np.testing.assert_allclose(p.sum(axis=1), np.ones(3), atol=1e-5)
+
+
+def test_explicit_weights_set_relative_mass(tmp_path):
+    paths = [_write(tmp_path, "A.csv", _PA), _write(tmp_path, "B.csv", _PB)]
+    data = load_multi_community_dataset(paths, community_weights=[3.0, 1.0], seed=0)
+
+    np.testing.assert_allclose(data.community_weights, [0.75, 0.25])
+    p = data.p_all.numpy()
+    ci = data.community_index
+    np.testing.assert_allclose(p[:, ci == 0].sum(axis=1), np.full(3, 0.75), atol=1e-5)
+    np.testing.assert_allclose(p[:, ci == 1].sum(axis=1), np.full(3, 0.25), atol=1e-5)
+
+
+def test_weights_validation(tmp_path):
+    paths = [_write(tmp_path, "A.csv", _PA), _write(tmp_path, "B.csv", _PB)]
+    with pytest.raises(ValueError, match="2 communities"):
+        load_multi_community_dataset(paths, community_weights=[1.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match="non-negative"):
+        load_multi_community_dataset(paths, community_weights=[-1.0, 2.0])
+    with pytest.raises(ValueError, match="all zero"):
+        load_multi_community_dataset(paths, community_weights=[0.0, 0.0])
+    with pytest.raises(ValueError, match="must be 'equal'"):
+        load_multi_community_dataset(paths, community_weights="uniform")
+
+
+def test_weighting_incompatible_with_min_reads(tmp_path):
+    paths = [_write(tmp_path, "A.csv", _PA), _write(tmp_path, "B.csv", _PB)]
+    with pytest.raises(ValueError, match="incompatible with min_reads"):
+        load_multi_community_dataset(
+            paths, community_weights="equal", min_reads=1000
+        )
+
+
+def test_weighting_applied_to_ptest(tmp_path):
+    train = [_write(tmp_path, "A.csv", _PA), _write(tmp_path, "B.csv", _PB)]
+    ptest_a = np.array([[1.0, 2.0], [3.0, 4.0]])
+    ptest_b = np.array([[5.0, 6.0], [7.0, 8.0]])
+    test = [_write(tmp_path, "Pa.csv", ptest_a), _write(tmp_path, "Pb.csv", ptest_b)]
+    data = load_multi_community_dataset(
+        train, test_paths=test, community_weights="equal", seed=0
+    )
+    pt = data.p_test.numpy()               # (2 pairs, 4 species)
+    ci = data.community_index
+    # each community block carries half the mass of every test column too
+    np.testing.assert_allclose(pt[:, ci == 0].sum(axis=1), np.full(2, 0.5), atol=1e-5)
+    np.testing.assert_allclose(pt[:, ci == 1].sum(axis=1), np.full(2, 0.5), atol=1e-5)
+
+
 def test_read_depth_filter_remaps_community_index(tmp_path):
     # Raw counts so the filter is meaningful. Sample 0 is shallow (total small).
     a = np.array([[1.0, 2000.0, 3000.0, 4000.0],

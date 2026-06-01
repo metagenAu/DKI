@@ -94,6 +94,50 @@ Requirements and behaviour:
   `f`, only `z` varies. The communities are fused into a single larger
   community, not given community-specific parameters.
 
+### Amplicons / metabarcoding from separate markers (compositionality)
+
+Amplicon data is **compositional** — each sample is relative abundance
+that sums to 1 *within whatever was sequenced*. DKI is built for this and
+handles a **single marker** well (simplex dynamics, Bray–Curtis loss).
+The catch is fusing **separate marker libraries** (e.g. 16S for bacteria,
+ITS for fungi, 18S for eukaryotes): each marker is closed to its own
+sequencing total, so there is **no shared scale** between them and the
+true between-community proportions are **not identifiable from the data**.
+Stacking raw reads and renormalising would let sequencing depth / primer
+bias / copy-number variation decide the cross-kingdom ratio — an artifact.
+
+Two situations:
+
+* **One library split by taxonomy** (one PCR, then separated into tables) —
+  the groups share one real denominator, so the default raw fusion
+  (`community_weights=None`) re-merges the true composition correctly.
+* **Separate marker libraries** — there is no common scale. Use
+  `community_weights` to make the cross-community weighting an **explicit
+  assumption** instead of an accident of depth:
+
+  ```python
+  data = load_multi_community_dataset(
+      ["bacteria.csv", "fungi.csv", "archaea.csv"],
+      community_weights="equal",        # each marker = 1/N of the joint mass
+      # community_weights=[0.7, 0.2, 0.1]  # or a chosen mass split
+  )
+  ```
+
+  Each marker is first normalised to a within-marker composition, then
+  given its declared share of every sample's joint composition.
+  **Within-marker keystoneness rankings are unaffected** by this choice;
+  **only cross-marker comparisons depend on it**, so report the weights
+  you used. If you ever obtain absolute totals per marker (qPCR load,
+  spike-ins, flow cytometry), pass those normalised totals as
+  `community_weights` to recover biologically meaningful proportions.
+
+`load_multi_community_dataset` **warns** whenever it fuses more than one
+community with the default raw scaling, since that is only valid for the
+one-library case. `community_weights` operates on relative compositions
+and so cannot be combined with `min_reads` (do read-depth QC on the raw
+per-marker counts upstream). The applied weights are recorded on
+`DKIData.community_weights`.
+
 A Colab notebook that runs the whole pipeline end-to-end lives at
 [`notebooks/dki_colab.ipynb`](notebooks/dki_colab.ipynb)
 ([open in Colab](https://colab.research.google.com/github/metagenAu/DKI/blob/claude/peaceful-goodall-4AC8l/notebooks/dki_colab.ipynb)).

@@ -95,6 +95,11 @@ class DKIData:
     # species index back to its originating community.
     community_index: Optional[np.ndarray] = None
     community_names: Optional[list] = None
+    # The per-community mass weights actually applied when fusing separately-
+    # normalised communities (e.g. amplicons from different marker libraries).
+    # ``None`` means the communities were stacked on a single shared scale
+    # (raw concatenation), appropriate only when they came from one library.
+    community_weights: Optional[np.ndarray] = None
 
     def to(self, device: torch.device) -> "DKIData":
         return DKIData(
@@ -111,6 +116,7 @@ class DKIData:
             kept_taxa=self.kept_taxa,
             community_index=self.community_index,
             community_names=self.community_names,
+            community_weights=self.community_weights,
         )
 
 
@@ -181,6 +187,7 @@ def _assemble_dataset(
     min_reads: float,
     community_index: Optional[np.ndarray] = None,
     community_names: Optional[List[str]] = None,
+    community_weights: Optional[np.ndarray] = None,
     log_prefix: str = "load_dataset",
 ) -> DKIData:
     """Build a :class:`DKIData` from already-loaded raw count matrices.
@@ -264,6 +271,7 @@ def _assemble_dataset(
         kept_taxa=kept_taxa,
         community_index=community_index,
         community_names=community_names,
+        community_weights=community_weights,
     )
 
 
@@ -328,6 +336,63 @@ def stack_communities(
     return combined, community_index
 
 
+def _resolve_community_weights(
+    community_weights: Optional[Union[str, Sequence[float]]], n_communities: int
+) -> Optional[np.ndarray]:
+    """Turn the ``community_weights`` argument into a length-N array summing to 1.
+
+    ``None`` -> ``None`` (no weighting; raw shared-scale stacking).
+    ``"equal"`` -> uniform ``1/N``.
+    A sequence -> normalised to sum 1 (must be length N, non-negative, not all 0).
+    """
+    if community_weights is None:
+        return None
+    if isinstance(community_weights, str):
+        if community_weights != "equal":
+            raise ValueError(
+                f"community_weights string must be 'equal', got {community_weights!r}."
+            )
+        return np.full(n_communities, 1.0 / n_communities)
+    w = np.asarray(list(community_weights), dtype=float)
+    if w.shape != (n_communities,):
+        raise ValueError(
+            f"community_weights has {w.shape[0]} entries but there are "
+            f"{n_communities} communities."
+        )
+    if np.any(w < 0):
+        raise ValueError("community_weights must be non-negative.")
+    total = w.sum()
+    if total <= 0:
+        raise ValueError("community_weights must not be all zero.")
+    return w / total
+
+
+def _apply_community_weights(
+    M: np.ndarray, community_index: np.ndarray, weights: np.ndarray
+) -> np.ndarray:
+    """Re-scale each community block to a declared per-sample mass share.
+
+    For separately-amplified markers there is no shared scale across
+    communities, so the only honest fusion is an explicit one: normalise each
+    community to a within-marker composition (columns sum to 1) and give it a
+    fixed mass ``weights[c]`` of the joint per-sample composition. ``M`` has the
+    combined row layout described by ``community_index``.
+
+    A community absent from a given sample (all-zero block) contributes no mass;
+    the joint column then sums to the weights of the *present* communities only,
+    which the downstream per-sample normalisation rescales — mass cannot be
+    assigned to a community that was not observed in that sample.
+    """
+    out = M.astype(np.float64, copy=True)
+    for c, w in enumerate(weights):
+        rows = community_index == c
+        block = out[rows]
+        col_sum = block.sum(axis=0, keepdims=True)
+        col_sum = np.where(col_sum == 0, 1.0, col_sum)
+        out[rows] = block / col_sum * w
+    return out
+
+
 def _stack_test_matrices(
     paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]],
     n_species: int,
@@ -381,6 +446,7 @@ def load_multi_community_dataset(
     test_paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
     ztest_paths: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
     community_names: Optional[Sequence[str]] = None,
+    community_weights: Optional[Union[str, Sequence[float]]] = None,
     val_fraction: float = 0.2,
     seed: int = 0,
     test_uses_z: bool = True,
@@ -411,6 +477,30 @@ def load_multi_community_dataset(
         defaults to the file stems. Recorded on ``DKIData.community_names`` and,
         together with ``DKIData.community_index``, lets downstream code map a
         combined species index back to its originating community.
+    community_weights
+        How to set the relative *mass* of each community in the fused
+        composition. This matters when the communities are **separately
+        amplified markers** (e.g. 16S + ITS + 18S): each marker is closed to its
+        own sequencing total, so the data carries **no shared scale** between
+        them and the true between-community proportions are not identifiable.
+
+        * ``None`` (default) — concatenate the raw matrices and renormalise
+          jointly. Correct only when all communities came from **one** library
+          (one PCR split by taxonomy). For separate libraries this lets
+          sequencing depth decide the between-community ratio, which is
+          meaningless; a warning is emitted when ``N > 1``.
+        * ``"equal"`` — normalise each community to a within-marker composition,
+          then give every community an equal ``1/N`` share of each sample's
+          joint composition. The honest default for separate markers: an
+          explicit, depth-independent assumption.
+        * a sequence of ``N`` non-negative weights — as ``"equal"`` but with a
+          chosen per-community mass (normalised to sum 1).
+
+        Either way, **within-community keystoneness rankings are unaffected by
+        the choice; only cross-community comparisons depend on it** — report the
+        weights you used. The applied weights are stored on
+        ``DKIData.community_weights``. Weighting requires relative input, so it
+        is incompatible with ``min_reads`` (raise); do read-depth QC upstream.
     val_fraction, seed, test_uses_z, min_reads
         Same meaning as in :func:`load_dataset`. The read-depth filter, when
         enabled, runs on the **combined** matrix (a sample is judged by its total
@@ -449,6 +539,32 @@ def load_multi_community_dataset(
         else None
     )
 
+    weights = _resolve_community_weights(community_weights, n_communities)
+    if weights is not None:
+        if min_reads and min_reads > 0:
+            raise ValueError(
+                "community_weights operates on relative compositions and is "
+                "incompatible with min_reads (read-depth QC needs raw counts). "
+                "Filter each community's counts upstream, then fuse with weights."
+            )
+        P = _apply_community_weights(P, community_index, weights)
+        # Ptest is the observed after-removal composition that predictions are
+        # scored against, so it must live on the same weighted simplex. Ztest is
+        # presence-only (binarised downstream), so weighting it is a no-op — skip.
+        if P_test is not None:
+            P_test = _apply_community_weights(P_test, community_index, weights)
+    elif n_communities > 1:
+        warnings.warn(
+            f"Fusing {n_communities} communities by raw concatenation "
+            "(community_weights=None). This is only valid if they came from ONE "
+            "amplicon library (one marker split by taxonomy). For SEPARATELY "
+            "amplified markers (e.g. 16S + ITS) there is no shared scale, so the "
+            "between-community ratio would be driven by sequencing depth. Pass "
+            "community_weights='equal' (or explicit weights) to make the "
+            "assumption explicit.",
+            stacklevel=2,
+        )
+
     return _assemble_dataset(
         P,
         P_test,
@@ -459,5 +575,6 @@ def load_multi_community_dataset(
         min_reads=min_reads,
         community_index=community_index,
         community_names=community_names,
+        community_weights=weights,
         log_prefix="load_multi_community_dataset",
     )
