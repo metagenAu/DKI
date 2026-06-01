@@ -68,22 +68,28 @@ def predict(
     ``odeint`` (or DEQ) call.
     """
     func.eval()
+    model_device = next(func.parameters()).device
     outs = []
     for start in range(0, z.shape[0], batch_size):
-        chunk = z[start : start + batch_size]
-        outs.append(
-            equilibrium(
-                func,
-                chunk,
-                mode=mode,
-                t_final=t_final,
-                method=method,
-                rtol=rtol,
-                atol=atol,
-                deq_step=deq_step,
-                deq_max_iter=deq_max_iter,
-                deq_tol=deq_tol,
-                deq_fallback=deq_fallback,
-            )
+        chunk = z[start : start + batch_size].to(model_device)
+        out = equilibrium(
+            func,
+            chunk,
+            mode=mode,
+            t_final=t_final,
+            method=method,
+            rtol=rtol,
+            atol=atol,
+            deq_step=deq_step,
+            deq_max_iter=deq_max_iter,
+            deq_tol=deq_tol,
+            deq_fallback=deq_fallback,
         )
+        # Offload each batch back to z's device immediately. This keeps only a
+        # single batch resident on the model's (GPU) device at a time: without
+        # it, every batch output stays on the GPU until the final cat, which
+        # OOMs on large inputs such as the leave-one-out assemblages in the
+        # keystoneness workflow. Moving the chunk onto the model device first
+        # also lets callers pass a CPU `z` while the model lives on the GPU.
+        outs.append(out.to(z.device))
     return torch.cat(outs, dim=0)
