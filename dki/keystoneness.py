@@ -351,19 +351,20 @@ def null_model_keystoneness(
             chosen = candidates
 
         focal_offset = len(loo_rows)
-        loo_rows.append(_loo_assemblage(z_s, sp))
+        loo_rows.append(_loo_assemblage(z_s, sp).cpu())
         null_offsets = []
         for c in chosen:
             null_offsets.append(len(loo_rows))
-            loo_rows.append(_loo_assemblage(z_s, int(c)))
+            loo_rows.append(_loo_assemblage(z_s, int(c)).cpu())
         pair_meta.append((focal_offset, null_offsets, chosen))
 
-    # Run the leave-one-out predictions in chunks so the GPU never has to hold
-    # the full (n_pairs * (1 + n_null)) batch at once, which OOMs on large runs.
+    # Stage LOO assemblages on CPU and move only one batch to the GPU at a
+    # time, so peak GPU memory is bounded by batch_size rather than the full
+    # n_pairs * (1 + n_null) stack.
     loo_stack = torch.stack(loo_rows, dim=0)
     chunks = []
     for start in range(0, loo_stack.shape[0], batch_size):
-        batch = loo_stack[start:start + batch_size]
+        batch = loo_stack[start:start + batch_size].to(device)
         with torch.no_grad():
             chunks.append(predict_fn(batch).detach().cpu().numpy())
     q_loo = np.concatenate(chunks, axis=0)
