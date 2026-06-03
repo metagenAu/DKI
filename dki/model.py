@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 from torch import nn
-from torchdiffeq import odeint
+from torchdiffeq import odeint, odeint_adjoint
 
 
 class ReplicatorODEFunc(nn.Module):
@@ -116,8 +116,17 @@ def integrate(
     if z0.dim() == 1:
         z0 = z0.unsqueeze(0)
     t = torch.tensor([0.0, float(t_final)], dtype=z0.dtype, device=z0.device)
+    # Adjoint backprop is O(1) in the number of solver steps, which keeps the
+    # nonlinear, large-batch training forward from OOMing on a 16 GB card. Only
+    # pay that overhead when a backward is actually coming — validation and
+    # inference run under no_grad and stay on the cheaper direct odeint.
+    use_adjoint = torch.is_grad_enabled() and any(p.requires_grad for p in func.parameters())
+    solver = odeint_adjoint if use_adjoint else odeint
+    solver_kwargs: dict = {"method": method, "rtol": rtol, "atol": atol, "options": options}
+    if use_adjoint:
+        solver_kwargs["adjoint_params"] = tuple(func.parameters())
     try:
-        traj = odeint(func, z0, t, method=method, rtol=rtol, atol=atol, options=options)
+        traj = solver(func, z0, t, **solver_kwargs)
         out = traj[-1]
         if torch.isfinite(out).all():
             return out
@@ -130,7 +139,10 @@ def integrate(
             "fixed-step fallback is disabled (fallback_steps <= 0)."
         )
     step = float(t_final) / fallback_steps
-    traj = odeint(func, z0, t, method=fallback_method, options={"step_size": step})
+    fb_kwargs: dict = {"method": fallback_method, "options": {"step_size": step}}
+    if use_adjoint:
+        fb_kwargs["adjoint_params"] = tuple(func.parameters())
+    traj = solver(func, z0, t, **fb_kwargs)
     out = traj[-1]  # traj shape: (len(t), B, N)
 
     # The fixed-step fallback has no simplex projection and can still overflow on

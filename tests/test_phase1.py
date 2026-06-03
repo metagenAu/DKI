@@ -64,13 +64,14 @@ def test_integrate_falls_back_on_underflow_assertion(monkeypatch):
     z = z / z.sum(dim=-1, keepdim=True)
     methods = []
 
-    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None):
+    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None, **_):
         methods.append(method)
         if method == "dopri5":
             raise AssertionError("underflow in dt 3.1e-15")
         return torch.stack([y0, y0])  # fixed-step fallback returns a finite trajectory
 
     monkeypatch.setattr(model_mod, "odeint", fake_odeint)
+    monkeypatch.setattr(model_mod, "odeint_adjoint", fake_odeint)
     out = integrate(ReplicatorODEFunc(N), z, t_final=100.0)
     assert methods == ["dopri5", "rk4"]
     assert out.shape == z.shape
@@ -84,13 +85,14 @@ def test_integrate_falls_back_on_nonfinite_result(monkeypatch):
     z = z / z.sum(dim=-1, keepdim=True)
     methods = []
 
-    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None):
+    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None, **_):
         methods.append(method)
         if method == "dopri5":
             return torch.stack([y0, torch.full_like(y0, float("nan"))])
         return torch.stack([y0, y0])
 
     monkeypatch.setattr(model_mod, "odeint", fake_odeint)
+    monkeypatch.setattr(model_mod, "odeint_adjoint", fake_odeint)
     out = integrate(ReplicatorODEFunc(N), z, t_final=100.0)
     assert methods == ["dopri5", "rk4"]
     assert torch.isfinite(out).all()
@@ -106,7 +108,7 @@ def test_integrate_recovers_when_fixed_step_fallback_also_diverges(monkeypatch):
     z = z / z.sum(dim=-1, keepdim=True)
     methods = []
 
-    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None):
+    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None, **_):
         methods.append(method)
         # Row 0 stays finite; rows 1 and 2 blow up in *both* solvers.
         bad = y0.clone()
@@ -114,6 +116,7 @@ def test_integrate_recovers_when_fixed_step_fallback_also_diverges(monkeypatch):
         return torch.stack([y0, bad])
 
     monkeypatch.setattr(model_mod, "odeint", fake_odeint)
+    monkeypatch.setattr(model_mod, "odeint_adjoint", fake_odeint)
     out = integrate(ReplicatorODEFunc(N), z, t_final=100.0, fallback_steps=20)
     assert methods == ["dopri5", "rk4"]
     assert torch.isfinite(out).all()
@@ -144,9 +147,10 @@ def test_integrate_reraises_when_fallback_disabled(monkeypatch):
     z = torch.rand(2, N)
     z = z / z.sum(dim=-1, keepdim=True)
 
-    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None):
+    def fake_odeint(func, y0, t, method=None, rtol=None, atol=None, options=None, **_):
         raise AssertionError("underflow in dt")
 
     monkeypatch.setattr(model_mod, "odeint", fake_odeint)
+    monkeypatch.setattr(model_mod, "odeint_adjoint", fake_odeint)
     with pytest.raises(AssertionError):
         integrate(ReplicatorODEFunc(N), z, t_final=100.0, fallback_steps=0)
